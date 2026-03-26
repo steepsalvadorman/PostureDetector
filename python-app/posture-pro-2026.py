@@ -1,29 +1,23 @@
 """
-Evaluador ROSA — NTP 1173 (INSST, 2022)   v3.1
+Evaluador ROSA — NTP 1173 (INSST, 2022)   v4.1
 ================================================
-INSTALACIÓN:
-    pip install opencv-python mediapipe numpy openpyxl pillow
-    pip install win10toast   (opcional — notificaciones Windows)
-    winsound: incluido en Python/Windows
-
-EMPAQUETAR:
-    pip install pyinstaller
-    pyinstaller --onefile --windowed --name ROSA_NTP1173 posture-pro-2026.py
+Compatibilidad: MediaPipe 0.10.x (nueva API)
 """
 
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks.python.components import containers
 import numpy as np
-import time, os, sys, threading, queue
+import time, os, threading, queue, urllib.request, sys
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+from openpyxl import Workbook
+from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side)
 from openpyxl.utils import get_column_letter
-
-
-
 
 try:
     import winsound
@@ -31,23 +25,18 @@ try:
 except ImportError:
     WINSOUND_OK = False
 
-try:
-    from win10toast import ToastNotifier
-    TOAST_OK = True
-except ImportError:
-    TOAST_OK = False
-
 # ─────────────────────────────────────────────────────────────
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────────────────────
-INTERVALO_SEG    = 10
-GUARDADO_SEG     = 3
-MAX_CAMARAS_SCAN = 6
-NIVEL_ACCION     = 5   # NTP 1173: score >= 5 requiere actuación inmediata
+INTERVALO_EVAL_SEG = 10
+GUARDADO_SEG       = 3
+MAX_CAMARAS_SCAN   = 6
+NIVEL_ACCION       = 5
 
-# ─────────────────────────────────────────────────────────────
-# PALETA DE DISEÑO — industrial / oscuro profesional
-# ─────────────────────────────────────────────────────────────
+# URL del modelo de pose landmarker de MediaPipe 0.10+
+MODEL_URL  = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+MODEL_PATH = os.path.join(os.path.expanduser("~"), "pose_landmarker_lite.task")
+
 C = {
     "bg_deep":   "#0A0C10",
     "bg_panel":  "#111318",
@@ -61,1059 +50,922 @@ C = {
     "ok":        "#00D68F",
     "warn":      "#F6AD3B",
     "danger":    "#FF4757",
-    "danger2":   "#CC1F2D",
 }
 
 NIVELES = {
-    1: ("Inapreciable",         "#00D68F"),
-    2: ("Bajo",                 "#00B87A"),
-    3: ("Medio",                "#F6AD3B"),
-    4: ("Medio-Alto",           "#E8823A"),
-    5: ("ALTO  —  ACTUAR YA",  "#FF4757"),
+    1: ("Inapreciable",        "#00D68F"),
+    2: ("Bajo",                "#00B87A"),
+    3: ("Medio",               "#F6AD3B"),
+    4: ("Medio-Alto",          "#E8823A"),
+    5: ("ALTO — ACTUAR YA",   "#FF4757"),
 }
 
-def nivel_accion(score):
-    k = 5 if score >= 5 else max(1, score)
-    return NIVELES[k]
+# Índices de landmarks en MediaPipe 0.10+ PoseLandmarker
+# (mismos números que antes pero acceso diferente)
+_LM = {
+    "NOSE":            0,
+    "LEFT_SHOULDER":  11,
+    "RIGHT_SHOULDER": 12,
+    "LEFT_ELBOW":     13,
+    "LEFT_WRIST":     15,
+    "LEFT_HIP":       23,
+    "RIGHT_HIP":      24,
+    "LEFT_KNEE":      25,
+    "LEFT_ANKLE":     27,
+}
 
 # ─────────────────────────────────────────────────────────────
 # TABLAS NTP 1173
 # ─────────────────────────────────────────────────────────────
-# TABLA_A — filas: (A1+A2)-2  |  cols: (A3+A4)-2
-# (A1 y A2 mínimo=1 cada uno → suma mínima=2 → índice 0)
-TABLA_A = np.array([
-    [2,2,3,4,5,6,7,8],[2,2,3,4,5,6,7,8],[3,3,3,4,5,6,7,8],
-    [4,4,4,4,5,6,7,8],[5,5,5,5,6,7,8,9],[6,6,6,7,7,8,8,9],[7,7,7,8,8,9,9,9],
-])
+_TABLA_A = [
+    [2,2,3,4,5,6,7,8],
+    [2,2,3,4,5,6,7,8],
+    [3,3,3,4,5,6,7,8],
+    [4,4,4,4,5,6,7,8],
+    [5,5,5,5,6,7,8,9],
+    [6,6,6,7,7,8,8,9],
+    [7,7,7,8,8,9,9,9],
+]
+_TABLA_B = [
+    [1,1,1,2,3,4,5,6,6],
+    [1,1,2,2,3,4,5,6,6],
+    [1,2,2,3,3,4,6,7,7],
+    [2,2,3,3,4,5,6,8,8],
+    [3,3,4,4,5,6,7,8,8],
+    [4,4,5,5,6,7,8,9,9],
+    [5,5,6,7,8,8,9,9,9],
+]
+_TABLA_C = [
+    [1,1,1,2,3,4,5,6],
+    [1,1,2,3,4,5,6,7],
+    [1,2,2,3,4,5,6,7],
+    [2,3,3,3,5,6,7,8],
+    [3,4,4,5,5,6,7,8],
+    [4,5,5,6,6,7,8,9],
+    [5,6,6,7,7,8,8,9],
+    [6,7,7,8,8,9,9,9],
+]
+_TABLA_D = [
+    [1,2,3,4,5,6,7,8,9],
+    [2,2,3,4,5,6,7,8,9],
+    [3,3,3,4,5,6,7,8,9],
+    [4,4,4,4,5,6,7,8,9],
+    [5,5,5,5,5,6,7,8,9],
+    [6,6,6,6,6,6,7,8,9],
+    [7,7,7,7,7,7,7,8,9],
+    [8,8,8,8,8,8,8,8,9],
+    [9,9,9,9,9,9,9,9,9],
+]
+_TABLA_E = [
+    [1, 2, 3, 4, 5, 6, 7, 8, 9,10],
+    [2, 2, 3, 4, 5, 6, 7, 8, 9,10],
+    [3, 3, 3, 4, 5, 6, 7, 8, 9,10],
+    [4, 4, 4, 4, 5, 6, 7, 8, 9,10],
+    [5, 5, 5, 5, 5, 6, 7, 8, 9,10],
+    [6, 6, 6, 6, 6, 6, 7, 8, 9,10],
+    [7, 7, 7, 7, 7, 7, 7, 8, 9,10],
+    [8, 8, 8, 8, 8, 8, 8, 8, 9,10],
+    [9, 9, 9, 9, 9, 9, 9, 9, 9,10],
+    [10,10,10,10,10,10,10,10,10,10],
+]
 
-# TABLA_B — filas: p_B1 (índice directo, fila 0 = "sin teléfono")
-#            cols: p_B2 (índice directo, col  0 = "sin pantalla")
-# IMPORTANTE: NO restar 1 al indexar. p_B1=1 → fila 1, p_B2=3 → col 3.
-TABLA_B = np.array([
-    [1,1,1,2,3,4,5,6,6],[1,1,2,2,3,4,5,6,6],[1,2,2,3,3,4,6,7,7],
-    [2,2,3,3,4,5,6,8,8],[3,3,4,4,5,6,7,8,8],[4,4,5,5,6,7,8,9,9],[5,5,6,7,8,8,9,9,9],
-])
+def _tlu(tabla, fi, ci):
+    fi = int(np.clip(fi, 0, len(tabla) - 1))
+    ci = int(np.clip(ci, 0, len(tabla[0]) - 1))
+    return int(tabla[fi][ci])
 
-# TABLA_C — filas: p_C1 (índice directo, fila 0 = "sin ratón")
-#            cols: p_C2 (índice directo, col  0 = "sin teclado")
-# IMPORTANTE: NO restar 1 al indexar. p_C1=1 → fila 1, p_C2=2 → col 2.
-TABLA_C = np.array([
-    [1,1,1,2,3,4,5,6],[1,1,2,3,4,5,6,7],[1,2,2,3,4,5,6,7],
-    [2,3,3,3,5,6,7,8],[3,4,4,5,5,6,7,8],[4,5,5,6,6,7,8,9],
-    [5,6,6,7,7,8,8,9],[6,7,7,8,8,9,9,9],
-])
+# ─────────────────────────────────────────────────────────────
+# LÓGICA ROSA
+# ─────────────────────────────────────────────────────────────
+def factor_tiempo_F(horas_diarias):
+    if horas_diarias > 4:   return +1
+    elif horas_diarias < 1: return -1
+    else:                   return 0
 
-# TABLA_D — filas: score_B-1  |  cols: score_C-1
-# (scores empiezan en 1 → índice 0 = score 1)
-TABLA_D = np.array([
-    [1,2,3,4,5,6,7,8,9],[2,2,3,4,5,6,7,8,9],[3,3,3,4,5,6,7,8,9],
-    [4,4,4,4,5,6,7,8,9],[5,5,5,5,5,6,7,8,9],[6,6,6,6,6,6,7,8,9],
-    [7,7,7,7,7,7,7,8,9],[8,8,8,8,8,8,8,8,9],[9,9,9,9,9,9,9,9,9],
-])
+def puntuar_A1(ang_rodilla):
+    return 1 if 85 <= ang_rodilla <= 100 else 2
 
-def tlu(tabla, fi, ci):
-    return int(tabla[int(np.clip(fi, 0, tabla.shape[0]-1))]
-                    [int(np.clip(ci, 0, tabla.shape[1]-1))])
+def puntuar_A2(dist=8):
+    return 1 if 5 <= dist <= 9 else 2
 
-def factor_tiempo_F(horas):
-    return +1 if horas > 4 else (-1 if horas < 1 else 0)
+def puntuar_A3(ang_codo):
+    return 1 if 80 <= ang_codo <= 110 else 2
 
+def puntuar_A4(ang_tronco):
+    incl = 90 + ang_tronco
+    return 1 if 95 <= incl <= 110 else 2
+
+def puntuar_B1():
+    return 1  # asume manos libres y distancia correcta
+
+def puntuar_B2(desv_cuello, factor_t=0):
+    if abs(desv_cuello) < 10:   p = 1
+    elif desv_cuello < 0:       p = 2
+    else:                       p = 3
+    return int(np.clip(p + factor_t, 1, 9))
+
+def puntuar_C1(factor_t=0):
+    return int(np.clip(1 + factor_t, 1, 9))
+
+def puntuar_C2(ang_muneca, factor_t=0):
+    p = 1 if abs(ang_muneca) <= 15 else 2
+    return int(np.clip(p + factor_t, 1, 9))
+
+def calcular_ROSA_completo(ang_tronco, ang_rodilla, ang_codo,
+                            desv_cuello, ang_muneca, horas_diarias):
+    ft = factor_tiempo_F(horas_diarias)
+    a1, a2 = puntuar_A1(ang_rodilla), puntuar_A2()
+    a3, a4 = puntuar_A3(ang_codo), puntuar_A4(ang_tronco)
+    suma_asiento = a1 + a2
+    suma_soporte = a3 + a4
+    tabla_A_val  = _tlu(_TABLA_A, suma_asiento - 2, suma_soporte - 2)
+    total_silla  = int(np.clip(tabla_A_val + ft, 1, 10))
+
+    b1 = puntuar_B1()
+    b2 = puntuar_B2(desv_cuello, ft)
+    tabla_B_val = _tlu(_TABLA_B, b1 - 1, b2 - 1)
+
+    c1 = puntuar_C1(ft)
+    c2 = puntuar_C2(ang_muneca, ft)
+    tabla_C_val = _tlu(_TABLA_C, c1 - 1, c2 - 1)
+
+    tabla_D_val = _tlu(_TABLA_D, tabla_B_val - 1, tabla_C_val - 1)
+    rosa = _tlu(_TABLA_E, total_silla - 1, tabla_D_val - 1)
+
+    return {
+        "ang_tronco":  round(ang_tronco, 1),
+        "ang_rodilla": round(ang_rodilla, 1),
+        "ang_codo":    round(ang_codo, 1),
+        "desv_cuello": round(desv_cuello, 1),
+        "ang_muneca":  round(ang_muneca, 1),
+        "A1": a1, "A2": a2, "A3": a3, "A4": a4,
+        "suma_asiento": suma_asiento, "suma_soporte": suma_soporte,
+        "tabla_A": tabla_A_val, "factor_tiempo": ft,
+        "total_silla": total_silla,
+        "B1": b1, "B2": b2, "tabla_B": tabla_B_val,
+        "C1": c1, "C2": c2, "tabla_C": tabla_C_val,
+        "tabla_D": tabla_D_val, "rosa": rosa,
+    }
+
+# ─────────────────────────────────────────────────────────────
+# ÁNGULOS
+# ─────────────────────────────────────────────────────────────
 def calcular_angulo(a, b, c):
     a, b, c = np.array(a), np.array(b), np.array(c)
     ba, bc = a - b, c - b
     cos = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
     return float(np.degrees(np.arccos(np.clip(cos, -1, 1))))
 
-def calcular_ROSA(ang_tronco, desv_cuello, ang_rodilla, ang_codo, factor_t):
-    # ── SILLA (Tablas A-1 … A-4) ──────────────────────────────
-    p_A1 = 1 if 85 <= ang_rodilla <= 100 else 2
-    p_A2 = 1
-    p_A3 = 1 if 80 <= ang_codo <= 105 else 2
-    p_A4 = 1 if 95 <= (90 + ang_tronco) <= 110 else 2
+def extraer_angulos_v2(landmarks, w, h):
+    """
+    Extrae ángulos usando la nueva API de MediaPipe 0.10+
+    landmarks: lista de NormalizedLandmark
+    """
+    try:
+        def gp(idx):
+            lm = landmarks[idx]
+            return [lm.x * w, lm.y * h]
 
-    score_A = tlu(TABLA_A, (p_A1 + p_A2) - 2, (p_A3 + p_A4) - 2)
-    score_s = int(np.clip(score_A + factor_t, 1, 10))
+        lsh  = gp(_LM["LEFT_SHOULDER"])
+        rsh  = gp(_LM["RIGHT_SHOULDER"])
+        lhi  = gp(_LM["LEFT_HIP"])
+        lkn  = gp(_LM["LEFT_KNEE"])
+        lank = gp(_LM["LEFT_ANKLE"])
+        lelb = gp(_LM["LEFT_ELBOW"])
+        lwri = gp(_LM["LEFT_WRIST"])
+        nose = gp(_LM["NOSE"])
 
-    # ── PERIFÉRICOS ────────────────────────────────────────────
-    # Tabla B-1: teléfono
-    p_B1 = 1   # postura neutra (cuello recto, uso con una mano)
+        ang_tronco  = calcular_angulo(lsh, lhi, [lhi[0], lhi[1] + 100]) - 90
+        ang_rodilla = calcular_angulo(lhi, lkn, lank)
+        ang_codo    = calcular_angulo(lsh, lelb, lwri)
 
-    # Tabla B-2: pantalla — desviación postural del cuello
-    p_B2 = 1 if desv_cuello < 10 else (2 if desv_cuello < 20 else 3)
+        mid_sh = [(lsh[0] + rsh[0]) / 2, (lsh[1] + rsh[1]) / 2]
+        desv_cuello = calcular_angulo(nose, mid_sh,
+                                      [mid_sh[0], mid_sh[1] + 100]) - 90
 
-    # FIX v3.1: indexar con p_B1 y p_B2 directamente (sin -1).
-    # TABLA_B incluye fila/col 0 para "elemento no presente"; p_Bx=1 → índice 1.
-    score_B = tlu(TABLA_B, p_B1, p_B2)
+        ang_muneca = calcular_angulo(lelb, lwri,
+                                     [lwri[0] + 100, lwri[1]]) - 90
 
-    # Tabla C-1: ratón / Tabla C-2: teclado
-    p_C1 = 1 if 80 <= ang_codo <= 110 else 2
-    p_C2 = 1 if 80 <= ang_codo <= 110 else 2
-
-    # FIX v3.1: mismo criterio que TABLA_B.
-    score_C = tlu(TABLA_C, p_C1, p_C2)
-
-    # Tabla D: periféricos combinados (scores 1-9 → índices 0-8)
-    score_D = tlu(TABLA_D, score_B - 1, score_C - 1)
-
-    # ── ROSA FINAL (Tabla E = max) ─────────────────────────────
-    rosa = int(np.clip(max(score_s, score_D), 1, 10))
-
-    det = {
-        "p_A1_altura":      p_A1,
-        "p_A2_profundidad": p_A2,
-        "p_A3_reposabrazos":p_A3,
-        "p_A4_respaldo":    p_A4,
-        "tabla_A":          score_A,
-        "factor_F":         factor_t,
-        "score_silla":      score_s,
-        "p_B1_telefono":    p_B1,
-        "p_B2_pantalla":    p_B2,
-        "tabla_B":          score_B,
-        "p_C1_raton":       p_C1,
-        "p_C2_teclado":     p_C2,
-        "tabla_C":          score_C,
-        "tabla_D":          score_D,
-        "rosa_final":       rosa,
-    }
-    return rosa, score_s, score_D, det
+        return ang_tronco, ang_rodilla, ang_codo, desv_cuello, ang_muneca
+    except Exception as e:
+        print(f"[extraer_angulos] error: {e}")
+        return None
 
 # ─────────────────────────────────────────────────────────────
-# AUDIO + NOTIFICACIONES
+# DESCARGA DEL MODELO
 # ─────────────────────────────────────────────────────────────
-def disparar_sonido(veces=4, freq=1200, dur=320):
-    def _run():
-        for _ in range(veces):
-            if WINSOUND_OK:
-                try: winsound.Beep(freq, dur); time.sleep(0.08)
-                except: pass
-            else:
-                sys.stdout.write("\a"); sys.stdout.flush(); time.sleep(0.3)
-    threading.Thread(target=_run, daemon=True).start()
-
-def disparar_toast(toaster, titulo, cuerpo):
-    if toaster and TOAST_OK:
-        def _go():
-            try: toaster.show_toast(titulo, cuerpo, duration=8, threaded=False)
-            except: pass
-        threading.Thread(target=_go, daemon=True).start()
+def descargar_modelo(callback_status=None):
+    if os.path.exists(MODEL_PATH):
+        print(f"[modelo] Ya existe: {MODEL_PATH}")
+        return True
+    try:
+        if callback_status:
+            callback_status("Descargando modelo de pose (~6 MB)...")
+        print(f"[modelo] Descargando desde {MODEL_URL}")
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        print(f"[modelo] Guardado en {MODEL_PATH}")
+        return True
+    except Exception as e:
+        print(f"[modelo] Error al descargar: {e}")
+        return False
 
 # ─────────────────────────────────────────────────────────────
-# DETECCIÓN DE CÁMARAS
+# EXCEL
 # ─────────────────────────────────────────────────────────────
-def detectar_camaras(max_idx=MAX_CAMARAS_SCAN):
-    found = []
-    for i in range(max_idx):
-        try:
-            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-            if cap.isOpened():
-                ret, _ = cap.read()
-                if ret: found.append((i, f"Cámara {i}"))
-                cap.release()
-        except: pass
-    return found or [(0, "Cámara 0 (por defecto)")]
-
-# ─────────────────────────────────────────────────────────────
-# EXPORTACIÓN XLSX
-# ─────────────────────────────────────────────────────────────
-COLS_XLSX = [
-    ("id_evaluado",          "id_evaluado"),
-    ("nombre_evaluado",      "nombre_evaluado"),
-    ("horas_uso_diario",     "horas_uso_diario"),
-    ("timestamp",            "timestamp"),
-    ("fecha",                "fecha"),
-    ("hora",                 "hora"),
-    ("rosa_final",           "rosa_final"),
-    ("nivel_riesgo",         "nivel_riesgo"),
-    ("alerta_disparada",     "alerta_disparada"),
-    ("score_silla",          "score_silla"),
-    ("score_perifericos_D",  "score_perifericos_D"),
-    ("p_A1_altura_asiento",  "p_A1_altura"),
-    ("p_A2_profundidad",     "p_A2_profundidad"),
-    ("p_A3_reposabrazos",    "p_A3_reposabrazos"),
-    ("p_A4_respaldo",        "p_A4_respaldo"),
-    ("tabla_A_silla",        "tabla_A"),
-    ("factor_tiempo_F",      "factor_F"),
-    ("p_B1_telefono",        "p_B1_telefono"),
-    ("p_B2_pantalla",        "p_B2_pantalla"),
-    ("tabla_B_tel_pant",     "tabla_B"),
-    ("p_C1_raton",           "p_C1_raton"),
-    ("p_C2_teclado",         "p_C2_teclado"),
-    ("tabla_C_rat_tec",      "tabla_C"),
-    ("tabla_D_perifericos",  "tabla_D"),
-    ("ang_tronco_deg",       "ang_tronco_deg"),
-    ("ang_cuello_desv_deg",  "ang_cuello_desv_deg"),
-    ("ang_rodilla_deg",      "ang_rodilla_deg"),
-    ("ang_codo_deg",         "ang_codo_deg"),
+HEADER_COLS = [
+    ("Timestamp",14),("ROSA Final",11),("Nivel",18),("Total Silla",12),
+    ("Total Periféric.",13),("A1-Altura",11),("A2-Profund.",12),
+    ("A3-Reposabr.",13),("A4-Respaldo",12),("Tabla A",10),
+    ("FactorTiempo",13),("B1-Teléfono",12),("B2-Pantalla",12),
+    ("Tabla B",10),("C1-Ratón",11),("C2-Teclado",12),("Tabla C",10),
+    ("Tabla D",10),("Áng.Tronco°",13),("Áng.Rodilla°",13),
+    ("Áng.Codo°",12),("Desv.Cuello°",13),("Áng.Muñeca°",13),
 ]
+COLOR_NIVEL = {1:"00D68F",2:"00B87A",3:"F6AD3B",4:"E8823A",5:"FF4757"}
 
-def exportar_xlsx(ruta, registros):
-    def thin():
-        s = Side(style="thin", color="BFBFBF")
-        return Border(left=s, right=s, top=s, bottom=s)
-    hdrs = [c for c, _ in COLS_XLSX]
-    if os.path.exists(ruta):
-        wb = load_workbook(ruta); ws = wb.active
-        ya = ws.max_row - 1
-        nuevos = registros[ya:]
-        fi = ws.max_row + 1
-    else:
-        wb = Workbook(); ws = wb.active; ws.title = "ROSA_Evaluaciones"
-        fill_h = PatternFill("solid", fgColor="0D1B2A")
-        for ci, col in enumerate(hdrs, 1):
-            c = ws.cell(row=1, column=ci, value=col)
-            c.font      = Font(bold=True, color="00C8FF", size=10, name="Calibri")
-            c.fill      = fill_h
-            c.alignment = Alignment(horizontal="center", vertical="center")
-            c.border    = thin()
-        anchos = {
-            "timestamp": 17, "fecha": 12, "hora": 10,
-            "nombre_evaluado": 22, "id_evaluado": 14,
-            "nivel_riesgo": 20, "alerta_disparada": 16,
-            "ang_tronco_deg": 15, "ang_cuello_desv_deg": 19,
-            "ang_rodilla_deg": 15, "ang_codo_deg": 13,
-        }
-        for ci, (_, k) in enumerate(COLS_XLSX, 1):
-            ws.column_dimensions[get_column_letter(ci)].width = anchos.get(k, 13)
-        ws.freeze_panes   = "A2"
-        ws.auto_filter.ref = f"A1:{get_column_letter(len(hdrs))}1"
-        ws.row_dimensions[1].height = 22
-        nuevos = registros; fi = 2
-    for idx, reg in enumerate(nuevos):
-        fila = fi + idx
-        bg   = "0D1B2A" if fila % 2 == 0 else "111827"
-        fill = PatternFill("solid", fgColor=bg)
-        for ci, (_, k) in enumerate(COLS_XLSX, 1):
-            c = ws.cell(row=fila, column=ci, value=reg.get(k, ""))
-            c.font      = Font(size=10, name="Calibri", color="C8D8E8")
-            c.fill      = fill
-            c.alignment = Alignment(
-                horizontal="left" if ci <= 2 else "center",
-                vertical="center")
-            c.border = thin()
+def _border():
+    t = Side(style="thin", color="C0C0C0")
+    return Border(left=t, right=t, top=t, bottom=t)
+
+def _hdr_fill():
+    return PatternFill("solid", fgColor="1F3864")
+
+def nivel_texto(score):
+    return NIVELES[min(max(score,1),5)][0]
+
+def crear_excel_nuevo(ruta):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Registros ROSA"
+    ws.merge_cells("A1:W1")
+    c = ws["A1"]
+    c.value = "EVALUACIÓN ERGONÓMICA — MÉTODO ROSA (NTP 1173 INSST 2022)"
+    c.font = Font(name="Arial", bold=True, size=13, color="FFFFFF")
+    c.fill = PatternFill("solid", fgColor="0A2342")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 26
+
+    ws.merge_cells("A2:W2")
+    s = ws["A2"]
+    s.value = f"Generado: {time.strftime('%Y-%m-%d %H:%M:%S')}  |  Nivel de acción: >= 5"
+    s.font = Font(name="Arial", size=9, italic=True, color="7F9FBF")
+    s.fill = PatternFill("solid", fgColor="0D1B2A")
+    s.alignment = Alignment(horizontal="center")
+    ws.row_dimensions[2].height = 16
+
+    for ci, (titulo, ancho) in enumerate(HEADER_COLS, 1):
+        cell = ws.cell(row=3, column=ci, value=titulo)
+        cell.font = Font(name="Arial", bold=True, size=10, color="FFFFFF")
+        cell.fill = _hdr_fill()
+        cell.alignment = Alignment(horizontal="center", vertical="center",
+                                   wrap_text=True)
+        cell.border = _border()
+        ws.column_dimensions[get_column_letter(ci)].width = ancho
+    ws.row_dimensions[3].height = 30
+    ws.freeze_panes = "A4"
+
+    ws2 = wb.create_sheet("Resumen")
+    ws2["A1"] = "RESUMEN EVALUACIÓN ROSA"
+    ws2["A1"].font = Font(name="Arial", bold=True, size=14, color="FFFFFF")
+    ws2["A1"].fill = PatternFill("solid", fgColor="0A2342")
+    ws2["A1"].alignment = Alignment(horizontal="center")
+    ws2.merge_cells("A1:D1")
+    for ci, h in enumerate(["Indicador","Valor","Descripción"], 1):
+        c = ws2.cell(row=2, column=ci, value=h)
+        c.font = Font(name="Arial", bold=True, color="FFFFFF")
+        c.fill = _hdr_fill()
+        c.alignment = Alignment(horizontal="center")
+    ws2.column_dimensions["A"].width = 25
+    ws2.column_dimensions["B"].width = 12
+    ws2.column_dimensions["C"].width = 35
+    wb.save(ruta)
+    return wb
+
+def agregar_registro_excel(ruta, registro, num_fila):
+    from openpyxl import load_workbook as _lw
+    wb = _lw(ruta)
+    ws = wb["Registros ROSA"]
+    rosa = registro["rosa"]
+    nivel = nivel_texto(rosa)
+    color_nivel = COLOR_NIVEL.get(min(rosa, 5), "FF4757")
+    fila = num_fila + 3
+    valores = [
+        registro.get("time",""), rosa, nivel,
+        registro.get("total_silla",""), registro.get("tabla_D",""),
+        registro.get("A1",""), registro.get("A2",""),
+        registro.get("A3",""), registro.get("A4",""),
+        registro.get("tabla_A",""), registro.get("factor_tiempo",""),
+        registro.get("B1",""), registro.get("B2",""),
+        registro.get("tabla_B",""), registro.get("C1",""),
+        registro.get("C2",""), registro.get("tabla_C",""),
+        registro.get("tabla_D",""), registro.get("ang_tronco",""),
+        registro.get("ang_rodilla",""), registro.get("ang_codo",""),
+        registro.get("desv_cuello",""), registro.get("ang_muneca",""),
+    ]
+    fondo = "F0F6FF" if num_fila % 2 == 0 else "FFFFFF"
+    for ci, val in enumerate(valores, 1):
+        cell = ws.cell(row=fila, column=ci, value=val)
+        cell.font = Font(name="Arial", size=9)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = _border()
+        if ci == 2:
+            cell.fill = PatternFill("solid", fgColor=color_nivel)
+            cell.font = Font(name="Arial", bold=True, size=11, color="FFFFFF")
+        elif ci == 3:
+            cell.fill = PatternFill("solid", fgColor=color_nivel)
+            cell.font = Font(name="Arial", bold=True, size=9,
+                             color="FFFFFF" if rosa >= 3 else "000000")
+        else:
+            cell.fill = PatternFill("solid", fgColor=fondo)
+    ws.row_dimensions[fila].height = 18
+
+    ws2 = wb["Resumen"]
+    rosas = []
+    for r in range(4, fila + 1):
+        v = ws.cell(row=r, column=2).value
+        if isinstance(v, (int, float)):
+            rosas.append(v)
+    resumen_data = [
+        ("Total registros", num_fila, "Evaluaciones realizadas"),
+        ("Último ROSA", rosa, nivel),
+        ("ROSA promedio", round(np.mean(rosas),2) if rosas else "", "Media"),
+        ("ROSA máximo", max(rosas) if rosas else "", "Puntuación más alta"),
+        ("ROSA mínimo", min(rosas) if rosas else "", "Puntuación más baja"),
+        ("Alertas (>=5)", sum(1 for r in rosas if r >= 5),
+         "Evaluaciones sobre nivel de acción"),
+    ]
+    for ri, (ind, val, desc) in enumerate(resumen_data, 3):
+        ws2.cell(row=ri, column=1, value=ind).font = Font(name="Arial", bold=True, size=10)
+        ws2.cell(row=ri, column=2, value=val).font = Font(name="Arial", size=10)
+        ws2.cell(row=ri, column=3, value=desc).font = Font(name="Arial", size=9, color="606060")
     wb.save(ruta)
 
 # ─────────────────────────────────────────────────────────────
-# HILO DE CÁMARA
+# HILO CÁMARA — API MediaPipe 0.10+
 # ─────────────────────────────────────────────────────────────
 class HiloCamara(threading.Thread):
-
-    def __init__(self, cola_datos, cola_frames, factor_t, cam_idx):
-
+    def __init__(self, cola_datos, cola_frames, cola_angulos, horas_diarias, cam_idx):
         super().__init__(daemon=True)
-
-        self.cola_datos  = cola_datos
-
-        self.cola_frames = cola_frames
-
-        self.factor_t    = factor_t
-
-        self.cam_idx     = cam_idx
-
-        self.activo      = True
-
-
-
-    def stop(self): self.activo = False
-
-
+        self.cola_datos    = cola_datos
+        self.cola_frames   = cola_frames
+        self.cola_angulos  = cola_angulos   # ángulos en tiempo real → GUI
+        self.horas_diarias = horas_diarias
+        self.cam_idx       = cam_idx
+        self.activo        = True
+        self._buf = {"tronco":[], "rodilla":[], "codo":[],
+                     "cuello":[], "muneca":[]}
+        # Resultado compartido entre callback y loop
+        self._ultimo_resultado = None
+        self._lock = threading.Lock()
 
     def run(self):
+        print("[hilo] Iniciando hilo de cámara...")
 
-        mp_pose = mp.solutions.pose
+        # ── Verificar modelo ──
+        if not os.path.exists(MODEL_PATH):
+            self.cola_datos.put({"error":
+                f"Modelo no encontrado en:\n{MODEL_PATH}\n"
+                "Ejecuta el programa con internet para descargarlo."})
+            return
 
-        pose    = mp_pose.Pose(model_complexity=1,
+        # ── Crear PoseLandmarker con callback (modo LIVE_STREAM) ──
+        def resultado_callback(result, output_image, timestamp_ms):
+            if result.pose_landmarks and len(result.pose_landmarks) > 0:
+                with self._lock:
+                    self._ultimo_resultado = result.pose_landmarks[0]
 
-                               min_detection_confidence=0.65,
+        base_opts = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+        opts = mp_vision.PoseLandmarkerOptions(
+            base_options=base_opts,
+            running_mode=mp_vision.RunningMode.LIVE_STREAM,
+            num_poses=1,
+            min_pose_detection_confidence=0.5,
+            min_pose_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+            result_callback=resultado_callback,
+        )
 
-                               min_tracking_confidence=0.55)
+        print("[hilo] Cargando modelo de pose...")
+        try:
+            landmarker = mp_vision.PoseLandmarker.create_from_options(opts)
+        except Exception as e:
+            self.cola_datos.put({"error": f"Error cargando modelo:\n{e}"})
+            return
 
-        mp_draw = mp.solutions.drawing_utils
+        print("[hilo] Modelo cargado. Abriendo cámara...")
 
+        # ── Abrir cámara ──
         cap = cv2.VideoCapture(self.cam_idx, cv2.CAP_DSHOW)
-
         if not cap.isOpened():
+            cap = cv2.VideoCapture(self.cam_idx)
+        if not cap.isOpened():
+            self.cola_datos.put({"error": "No se pudo acceder a la cámara."})
+            return
 
-            self.cola_datos.put({"error": f"No se pudo abrir cámara {self.cam_idx}."}); return
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        print("[hilo] Cámara abierta correctamente.")
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+        last_eval = time.time()
+        ts_ms = 0  # timestamp incremental para LIVE_STREAM
 
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        # Conexiones para dibujar esqueleto manualmente
+        CONEXIONES = [
+            (11,12),(11,13),(13,15),(12,14),(14,16),  # brazos
+            (11,23),(12,24),(23,24),                   # torso
+            (23,25),(25,27),(24,26),(26,28),           # piernas
+            (0,11),(0,12),                             # cuello aprox
+        ]
 
-        buffer, inicio = [], time.time()
-
-
-
-        while self.activo and cap.isOpened():
-
+        while self.activo:
             ret, frame = cap.read()
-
-            if not ret: time.sleep(0.02); continue
+            if not ret or frame is None:
+                continue
 
             frame = cv2.flip(frame, 1)
-
             h, w, _ = frame.shape
 
-            results = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-            perfil  = False
-
-
-
-            if results.pose_landmarks:
-
-                lm = results.pose_landmarks.landmark
-
-                dist_h = abs(lm[mp_pose.PoseLandmark.LEFT_SHOULDER].x -
-
-                             lm[mp_pose.PoseLandmark.RIGHT_SHOULDER].x) * w
-
-                if dist_h < 130:
-
-                    perfil = True
-
-                    lado = ("LEFT"
-
-                            if lm[mp_pose.PoseLandmark.LEFT_SHOULDER].visibility >
-
-                               lm[mp_pose.PoseLandmark.RIGHT_SHOULDER].visibility
-
-                            else "RIGHT")
-
-                    def gp(n):
-
-                        idx = getattr(mp_pose.PoseLandmark, f"{lado}_{n}")
-
-                        return [lm[idx].x * w, lm[idx].y * h]
-
-                    try:
-
-                        ear  = gp("EAR");    sh  = gp("SHOULDER")
-
-                        hip  = gp("HIP");    kn  = gp("KNEE")
-
-                        ank  = gp("ANKLE");  el  = gp("ELBOW")
-
-                        wr   = gp("WRIST")
-
-                        vert = [hip[0], hip[1] + 200]
-
-                        ang_tronco  = calcular_angulo(sh, hip, vert)
-
-                        desv_cuello = abs(180 - calcular_angulo(ear, sh, hip))
-
-                        ang_rodilla = calcular_angulo(hip, kn, ank)
-
-                        ang_codo    = calcular_angulo(sh, el, wr)
-
-                        buffer.append([ang_tronco, desv_cuello, ang_rodilla, ang_codo])
-
-                        mp_draw.draw_landmarks(
-
-                            frame, results.pose_landmarks,
-
-                            mp_pose.POSE_CONNECTIONS,
-
-                            mp_draw.DrawingSpec(color=(0,200,120), thickness=2, circle_radius=3),
-
-                            mp_draw.DrawingSpec(color=(0,160,255), thickness=2))
-
-                        for i, (lbl, val) in enumerate([
-
-                                ("Tronco",  ang_tronco), ("Cuello",  desv_cuello),
-
-                                ("Rodilla", ang_rodilla),("Codo",    ang_codo)]):
-
-                            cv2.putText(frame, f"{lbl}: {val:.0f}deg",
-
-                                        (12, h-14-i*18),
-
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0,200,120), 1)
-
-                    except: pass
-
-
-
-            cv2.rectangle(frame, (0,0), (w,52), (10,12,18), -1)
-
-            txt   = "PERFIL DETECTADO" if perfil else "POSICIONATE DE PERFIL"
-
-            color = (0,220,80) if perfil else (0,140,255)
-
-            cv2.putText(frame, txt, (14,34), cv2.FONT_HERSHEY_SIMPLEX, 0.72, color, 2)
-
-            restante = max(0, INTERVALO_SEG - int(time.time() - inicio))
-
-            cv2.putText(frame, f"EVAL EN {restante}s", (w-130,34),
-
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80,160,255), 1)
-
-
-
-            if not self.cola_frames.full():
-
-                self.cola_frames.put(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-
-
-            if time.time() - inicio >= INTERVALO_SEG and len(buffer) >= 3:
-
-                avg = np.mean(np.array(buffer), axis=0)
-
-                rosa, ss, sd, det = calcular_ROSA(
-
-                    float(avg[0]), float(avg[1]), float(avg[2]), float(avg[3]),
-
-                    self.factor_t)
-
-                if not self.cola_datos.full():
-
-                    self.cola_datos.put({
-
-                        "rosa": rosa, "score_silla": ss, "score_D": sd, "detalle": det,
-
-                        "angulos": {
-
-                            "ang_tronco_deg":      round(float(avg[0]), 1),
-
-                            "ang_cuello_desv_deg": round(float(avg[1]), 1),
-
-                            "ang_rodilla_deg":     round(float(avg[2]), 1),
-
-                            "ang_codo_deg":        round(float(avg[3]), 1),
-
-                        }})
-
-                buffer, inicio = [], time.time()
-
-
+            # Convertir a MediaPipe Image
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+            # Detectar (asíncrono con callback)
+            ts_ms += 33  # ~30fps
+            try:
+                landmarker.detect_async(mp_image, ts_ms)
+            except Exception as e:
+                print(f"[hilo] detect_async error: {e}")
+
+            # Dibujar landmarks del último resultado disponible
+            with self._lock:
+                lms = self._ultimo_resultado
+
+            if lms is not None:
+                # Dibujar puntos
+                for lm in lms:
+                    cx, cy = int(lm.x * w), int(lm.y * h)
+                    cv2.circle(frame, (cx, cy), 4, (0, 200, 255), -1)
+                # Dibujar huesos
+                for i, j in CONEXIONES:
+                    if i < len(lms) and j < len(lms):
+                        p1 = (int(lms[i].x*w), int(lms[i].y*h))
+                        p2 = (int(lms[j].x*w), int(lms[j].y*h))
+                        cv2.line(frame, p1, p2, (255, 255, 0), 2)
+
+                # Acumular ángulos + enviar en tiempo real a GUI
+                ang = extraer_angulos_v2(lms, w, h)
+                if ang:
+                    at, ar, ac, dc, am = ang
+                    self._buf["tronco"].append(at)
+                    self._buf["rodilla"].append(ar)
+                    self._buf["codo"].append(ac)
+                    self._buf["cuello"].append(dc)
+                    self._buf["muneca"].append(am)
+
+                    # Enviar ángulos actuales a la GUI (sin bloquear)
+                    if self.cola_angulos.full():
+                        try: self.cola_angulos.get_nowait()
+                        except queue.Empty: pass
+                    self.cola_angulos.put({
+                        "at": at, "ar": ar, "ac": ac,
+                        "dc": dc, "am": am
+                    })
+
+                    # Dibujar ángulos sobre el frame de video
+                    def color_ang(val, ok_min, ok_max):
+                        return (0,214,143) if ok_min <= abs(val) <= ok_max else (60,80,255)
+
+                    overlay_data = [
+                        (f"Tronco:  {at:+.1f}°",  color_ang(at, 0, 15),   20),
+                        (f"Rodilla: {ar:.1f}°",    color_ang(ar, 85, 100), 38),
+                        (f"Codo:    {ac:.1f}°",    color_ang(ac, 80, 110), 56),
+                        (f"Cuello:  {dc:+.1f}°",   color_ang(dc, 0, 10),   74),
+                        (f"Muneca:  {am:+.1f}°",   color_ang(am, 0, 15),   92),
+                    ]
+                    # Fondo semitransparente para el bloque de texto
+                    cv2.rectangle(frame, (w-200, 8), (w-4, 102),
+                                  (10, 12, 16), -1)
+                    cv2.rectangle(frame, (w-200, 8), (w-4, 102),
+                                  (37, 42, 52), 1)
+                    for texto, color, y in overlay_data:
+                        cv2.putText(frame, texto, (w-196, y),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                                    color, 1, cv2.LINE_AA)
+
+            # Overlay título
+            cv2.rectangle(frame, (0,0), (320,20), (10,12,16), -1)
+            cv2.putText(frame, "ROSA NTP-1173 Monitor",
+                        (8,14), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (0,200,255), 1, cv2.LINE_AA)
+
+            # Enviar frame a GUI
+            if self.cola_frames.full():
+                try: self.cola_frames.get_nowait()
+                except queue.Empty: pass
+            self.cola_frames.put(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+            # Evaluación periódica
+            if time.time() - last_eval >= INTERVALO_EVAL_SEG:
+                buf = self._buf
+                if all(len(v) > 0 for v in buf.values()):
+                    resultado = calcular_ROSA_completo(
+                        ang_tronco   = float(np.mean(buf["tronco"])),
+                        ang_rodilla  = float(np.mean(buf["rodilla"])),
+                        ang_codo     = float(np.mean(buf["codo"])),
+                        desv_cuello  = float(np.mean(buf["cuello"])),
+                        ang_muneca   = float(np.mean(buf["muneca"])),
+                        horas_diarias= self.horas_diarias,
+                    )
+                    resultado["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    self.cola_datos.put(resultado)
+                    for k in self._buf:
+                        self._buf[k].clear()
+                last_eval = time.time()
 
         cap.release()
-
-        self.cola_datos.put({"fin": True})
-
-# ─────────────────────────────────────────────────────────────
-# VENTANA DE ALERTA — solo score >= 5 (NTP 1173)
-# Cierre: mover el ratón
-# ─────────────────────────────────────────────────────────────
-class VentanaAlerta(tk.Toplevel):
-    def __init__(self, parent, rosa, nombre, callback_cerrar=None):
-        super().__init__(parent)
-        self._activa   = True
-        self._callback = callback_cerrar
-        self._blink_id = None
-        self._construir(rosa, nombre)
-        disparar_sonido(veces=4, freq=1200, dur=320)
-        self.bind("<Motion>",   lambda e: self.cerrar())
-        self.bind("<Button-1>", lambda e: self.cerrar())
-        self.bind("<Key>",      lambda e: self.cerrar())
-
-    def _construir(self, rosa, nombre):
-        bg = "#8B0000" if rosa >= 8 else (C["danger2"] if rosa >= 6 else C["danger"])
-        self._bg = bg
-        self.overrideredirect(True)
-        self.attributes("-topmost", True)
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f"{sw}x{sh}+0+0")
-        self.configure(bg=bg)
-
-        tk.Label(self, text=str(rosa), bg=bg, fg="white",
-                 font=("Courier New", 200, "bold")
-                 ).place(relx=0.5, rely=0.27, anchor="center")
-
-        cv_ = tk.Canvas(self, bg=bg, highlightthickness=0, height=3, width=sw-120)
-        cv_.place(relx=0.5, rely=0.52, anchor="center")
-        cv_.create_line(0, 1, sw-120, 1, fill="white", width=2)
-
-        tk.Label(self, text="NIVEL DE ACCION  ·  NTP 1173", bg=bg, fg="white",
-                 font=("Courier New", 40, "bold")
-                 ).place(relx=0.5, rely=0.60, anchor="center")
-
-        tk.Label(self,
-                 text="Puntuacion ROSA >= 5  —  Se requieren cambios inmediatos en el puesto de trabajo",
-                 bg=bg, fg="#FFCCCC", font=("Courier New", 17)
-                 ).place(relx=0.5, rely=0.70, anchor="center")
-
-        tk.Label(self, text=f"Trabajador: {nombre}", bg=bg, fg="white",
-                 font=("Courier New", 15)
-                 ).place(relx=0.5, rely=0.79, anchor="center")
-
-        tk.Label(self, text="Mueve el raton para cerrar", bg=bg, fg="#FF9999",
-                 font=("Courier New", 12)
-                 ).place(relx=0.5, rely=0.93, anchor="center")
-
-        self._blink(bg)
-
-    def _blink(self, base):
-        if not self._activa: return
-        c   = self.cget("bg")
-        alt = "#5C0000" if c == base else base
-        try:
-            self.configure(bg=alt)
-            for w in self.winfo_children():
-                try: w.configure(bg=alt)
-                except: pass
-        except: return
-        self._blink_id = self.after(700, lambda: self._blink(base))
-
-    def cerrar(self):
-        if not self._activa: return
-        self._activa = False
-        if self._blink_id:
-            try: self.after_cancel(self._blink_id)
-            except: pass
-        try: self.destroy()
-        except: pass
-        if self._callback: self._callback()
+        landmarker.close()
+        print("[hilo] Cámara cerrada.")
 
 # ─────────────────────────────────────────────────────────────
-# PANTALLA DE INICIO
+# GUI
 # ─────────────────────────────────────────────────────────────
-def _style_combo_popup(cb):
-    try:
-        cb.tk.eval(f"""
-            set popdown [ttk::combobox::PopdownWindow {cb}]
-            $popdown.f.l configure \
-                -background {C["bg_card"]} \
-                -foreground {C["text_hi"]} \
-                -selectbackground {C["accent2"]} \
-                -selectforeground {C["text_hi"]} \
-                -font {{"Courier New" 11}}
-        """)
-    except Exception:
-        pass
+def nivel_accion(score):
+    k = min(max(score,1),5)
+    return NIVELES[k]
 
-class PantallaInicio(tk.Toplevel):
-    W, H = 500, 600
 
-    def __init__(self, parent, camaras):
-        super().__init__(parent)
-        self.title("ROSA NTP 1173")
-        self.resizable(False, False)
-        self.grab_set()
-        self.resultado = None; self.camaras = camaras
+class PanelROSA(tk.Tk):
+    def __init__(self, nombre, horas_diarias, cam_idx, ruta_xlsx):
+        super().__init__()
+        self.title(f"Evaluador ROSA — NTP 1173  |  {nombre}")
+        self.geometry("1150x660")
         self.configure(bg=C["bg_deep"])
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f"{self.W}x{self.H}+{(sw-self.W)//2}+{(sh-self.H)//2}")
-        self._build()
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
-        self.wait_window()
+        self.resizable(True, True)
 
-    def _mk_field(self, parent, placeholder=""):
-        wrap = tk.Frame(parent, bg=C["bg_card"],
-                        highlightthickness=1, highlightbackground=C["bg_border"])
-        wrap.pack(fill="x", padx=44, pady=(0,0))
-        e = tk.Entry(wrap, bg=C["bg_card"], fg=C["text_hi"],
-                     insertbackground=C["accent"], relief="flat", bd=0,
-                     font=("Courier New", 12), highlightthickness=0)
-        e.pack(fill="x", padx=12, pady=9)
-        return e, wrap
+        self.cola_datos   = queue.Queue()
+        self.cola_frames  = queue.Queue(maxsize=2)
+        self.cola_angulos = queue.Queue(maxsize=2)   # ángulos tiempo real
+        self.registros    = []
+        self.ruta_xlsx    = ruta_xlsx
+        self.num_registro = 0
+        self._ultimo_guardado = time.time()
 
-    def _mk_combo(self, parent, values):
-        sty = ttk.Style(); sty.theme_use("clam")
-        sty.configure("D.TCombobox",
-            fieldbackground=C["bg_card"], background=C["bg_card"],
-            foreground=C["text_hi"], insertcolor=C["text_hi"],
-            arrowcolor=C["accent"], bordercolor=C["bg_border"],
-            lightcolor=C["bg_card"], darkcolor=C["bg_card"],
-            selectforeground=C["text_hi"], selectbackground=C["accent2"],
-            padding=(8,6))
-        sty.map("D.TCombobox",
-            fieldbackground=[("readonly",C["bg_card"]),("disabled",C["bg_deep"])],
-            foreground=[("readonly",C["text_hi"]),("disabled",C["text_lo"])],
-            selectforeground=[("readonly",C["text_hi"])],
-            selectbackground=[("readonly",C["accent2"])],
-            background=[("active",C["bg_border"]),("pressed",C["bg_border"])])
-        wrap = tk.Frame(parent, bg=C["bg_card"],
-                        highlightthickness=1, highlightbackground=C["bg_border"])
-        wrap.pack(fill="x", padx=44)
-        cb = ttk.Combobox(wrap, values=values, state="readonly",
-                          style="D.TCombobox", font=("Courier New", 11))
-        cb.pack(fill="x", padx=6, pady=4)
-        cb.bind("<Map>", lambda e, c=cb: _style_combo_popup(c))
-        return cb
+        crear_excel_nuevo(self.ruta_xlsx)
+        self._setup_ui()
 
-    def _lbl_section(self, parent, txt):
-        tk.Label(parent, text=txt, bg=C["bg_deep"], fg=C["text_mid"],
-                 font=("Courier New", 8, "bold"), anchor="w"
-                 ).pack(fill="x", padx=44, pady=(14,3))
+        self.hilo = HiloCamara(self.cola_datos, self.cola_frames,
+                               self.cola_angulos,
+                               horas_diarias, cam_idx)
+        self.hilo.start()
+        self._update_loop()
 
-    def _build(self):
-        hdr = tk.Frame(self, bg=C["bg_panel"], height=108)
-        hdr.pack(fill="x"); hdr.pack_propagate(False)
-        tk.Label(hdr, text="SISTEMA AUTOMATIZADO EVALUACIÓN ROSA",
-                 bg=C["bg_panel"], fg=C["accent"],
-                 font=("Courier New", 16, "bold")
-                 ).place(relx=0.5, rely=0.30, anchor="center")
-        tk.Label(hdr, text="PROYECTO TESIS  ·  JAIME TARAZONA",
-                 bg=C["bg_panel"], fg=C["text_mid"],
-                 font=("Courier New", 12, "bold")
-                 ).place(relx=0.5, rely=0.55, anchor="center")
+    def _setup_ui(self):
+        left = tk.Frame(self, bg=C["bg_deep"])
+        left.pack(side="left", fill="y", padx=(16,8), pady=16)
 
-        tk.Frame(self, bg=C["accent2"], height=2).pack(fill="x")
+        self.canvas = tk.Canvas(left, width=640, height=480,
+                                bg="black", highlightthickness=1,
+                                highlightbackground=C["accent2"])
+        self.canvas.pack()
+        self.img_id = self.canvas.create_image(0,0,anchor="nw")
 
-        self._lbl_section(self, "NOMBRE DEL TRABAJADOR")
-        self.e_nombre, self._wrap_nombre = self._mk_field(self)
-        self.e_nombre.focus()
+        status_bar = tk.Frame(left, bg=C["bg_panel"], height=28)
+        status_bar.pack(fill="x", pady=(4,0))
+        self.lbl_fps = tk.Label(status_bar, text="Inicializando...",
+                                font=("Consolas",8), bg=C["bg_panel"],
+                                fg=C["text_lo"])
+        self.lbl_fps.pack(side="left", padx=6)
+        self.lbl_xlsx_status = tk.Label(status_bar, text="",
+                                        font=("Consolas",8),
+                                        bg=C["bg_panel"], fg=C["ok"])
+        self.lbl_xlsx_status.pack(side="right", padx=6)
 
-        self._lbl_section(self, "ID / EXPEDIENTE")
-        self.e_id, self._wrap_id = self._mk_field(self)
+        right = tk.Frame(self, bg=C["bg_deep"])
+        right.pack(side="right", fill="both", expand=True, padx=(0,16), pady=16)
 
-        self._lbl_section(self, "USO DIARIO  (Tabla F · NTP 1173)")
-        self.cb_uso = self._mk_combo(self, [
-            "< 1 hora / dia       —  factor  -1",
-            "1 - 4 horas / dia    —  factor   0",
-            "> 4 horas / dia      —  factor  +1",
-        ])
-        self.cb_uso.current(1)
+        score_frame = tk.Frame(right, bg=C["bg_card"],
+                               highlightthickness=1,
+                               highlightbackground=C["bg_border"])
+        score_frame.pack(fill="x", pady=(0,8))
+        tk.Label(score_frame, text="PUNTUACIÓN ROSA FINAL",
+                 font=("Consolas",9,"bold"), bg=C["bg_card"],
+                 fg=C["text_lo"]).pack(pady=(10,0))
+        self.lbl_score = tk.Label(score_frame, text="--",
+                                  font=("Consolas",72,"bold"),
+                                  bg=C["bg_card"], fg=C["accent"])
+        self.lbl_score.pack()
+        self.lbl_nivel = tk.Label(score_frame, text="EN ESPERA",
+                                  font=("Consolas",12,"bold"),
+                                  bg=C["bg_card"], fg=C["text_mid"])
+        self.lbl_nivel.pack(pady=(0,10))
 
-        self._lbl_section(self, "CAMARA")
-        self.cb_cam = self._mk_combo(self, [lbl for _, lbl in self.camaras])
-        self.cb_cam.current(0)
+        tbl_frame = tk.Frame(right, bg=C["bg_card"],
+                             highlightthickness=1,
+                             highlightbackground=C["bg_border"])
+        tbl_frame.pack(fill="both", expand=True)
+        tk.Label(tbl_frame, text="DESGLOSE NTP 1173",
+                 font=("Consolas",9,"bold"), bg=C["bg_card"],
+                 fg=C["accent2"]).pack(pady=(8,4))
 
-        if len(self.camaras) == 1:
-            tk.Label(self, text="   Solo se detecto una camara",
-                     bg=C["bg_deep"], fg=C["text_mid"],
-                     font=("Courier New", 8)).pack(anchor="w", padx=44)
+        grid = tk.Frame(tbl_frame, bg=C["bg_card"])
+        grid.pack(padx=10, pady=4, fill="x")
 
-        tk.Frame(self, bg=C["bg_deep"]).pack(fill="both", expand=True)
-        tk.Frame(self, bg=C["bg_border"], height=1).pack(fill="x")
+        campos = [
+            ("SILLA",           None,          True),
+            ("A1 Altura",       "lbl_A1",      False),
+            ("A2 Profundidad",  "lbl_A2",      False),
+            ("A3 Reposabrazos", "lbl_A3",      False),
+            ("A4 Respaldo",     "lbl_A4",      False),
+            ("Tabla A",         "lbl_tA",      False),
+            ("Factor Tiempo",   "lbl_ft",      False),
+            ("Total Silla",     "lbl_tsilla",  False),
+            ("",                None,          False),
+            ("PERIFÉRICOS",     None,          True),
+            ("B1 Teléfono",     "lbl_B1",      False),
+            ("B2 Pantalla",     "lbl_B2",      False),
+            ("Tabla B",         "lbl_tB",      False),
+            ("C1 Ratón",        "lbl_C1",      False),
+            ("C2 Teclado",      "lbl_C2",      False),
+            ("Tabla C",         "lbl_tC",      False),
+            ("Tabla D",         "lbl_tD",      False),
+            ("",                None,          False),
+            ("ÁNGULOS (°)",     None,          True),
+            ("Tronco",          "lbl_at",      False),
+            ("Rodilla",         "lbl_ar",      False),
+            ("Codo",            "lbl_ac",      False),
+            ("Cuello desv.",    "lbl_dc",      False),
+            ("Muñeca",          "lbl_am",      False),
+        ]
 
-        foot = tk.Frame(self, bg=C["bg_panel"], height=72)
-        foot.pack(fill="x"); foot.pack_propagate(False)
-        self.btn = tk.Button(
-            foot, text="  \u25cf  INICIAR GRABACION",
-            bg=C["danger"], fg="white",
-            activebackground=C["danger2"], activeforeground="white",
-            font=("Courier New", 14, "bold"),
-            relief="flat", bd=0, cursor="hand2",
-            command=self._ok)
-        self.btn.place(relx=0.5, rely=0.5, anchor="center", width=340, height=46)
-        self.btn.bind("<Enter>", lambda e: self.btn.configure(bg="#FF2D3D"))
-        self.btn.bind("<Leave>", lambda e: self.btn.configure(bg=C["danger"]))
-
-        self.bind("<Return>", lambda _: self._ok())
-        self.bind("<Escape>", lambda _: self.destroy())
-
-    def _ok(self):
-        nombre = self.e_nombre.get().strip()
-        id_t   = self.e_id.get().strip()
-        err    = False
-        for e, w, v in [(self.e_nombre, self._wrap_nombre, nombre),
-                        (self.e_id,     self._wrap_id,     id_t)]:
-            if not v:
-                w.configure(highlightbackground=C["danger"], highlightcolor=C["danger"])
-                err = True
+        for i, (nombre, attr, es_titulo) in enumerate(campos):
+            if nombre == "":
+                tk.Label(grid, text="", bg=C["bg_card"], height=1).grid(row=i, column=0)
+                continue
+            if es_titulo:
+                tk.Label(grid, text=f"── {nombre} ──",
+                         font=("Consolas",9,"bold"),
+                         bg=C["bg_card"], fg=C["accent"],
+                         anchor="w").grid(row=i, column=0, columnspan=2,
+                                          sticky="w", pady=2)
             else:
-                w.configure(highlightbackground=C["bg_border"], highlightcolor=C["accent"])
-        if err: return
-        horas   = {0: 0.5, 1: 2.0, 2: 5.0}[self.cb_uso.current()]
-        cam_idx = self.camaras[self.cb_cam.current()][0]
-        self.resultado = {"nombre": nombre, "id": id_t, "horas": horas, "cam_idx": cam_idx}
+                tk.Label(grid, text=nombre, font=("Consolas",9),
+                         bg=C["bg_card"], fg=C["text_mid"],
+                         anchor="w", width=18).grid(row=i, column=0, sticky="w")
+                lbl = tk.Label(grid, text="—", font=("Consolas",9,"bold"),
+                               bg=C["bg_card"], fg=C["text_hi"],
+                               anchor="e", width=8)
+                lbl.grid(row=i, column=1, sticky="e")
+                if attr:
+                    setattr(self, attr, lbl)
+        grid.columnconfigure(0, weight=1)
+
+        btn_frame = tk.Frame(right, bg=C["bg_deep"])
+        btn_frame.pack(fill="x", pady=(8,0))
+        tk.Button(btn_frame, text="GUARDAR EXCEL AHORA",
+                  font=("Consolas",9,"bold"),
+                  bg=C["accent2"], fg="white",
+                  relief="flat", cursor="hand2",
+                  command=self._guardar_xlsx_manual
+                  ).pack(fill="x", ipady=6)
+        tk.Label(btn_frame,
+                 text=f"Auto-guardado cada {GUARDADO_SEG}s  |  {self.ruta_xlsx}",
+                 font=("Consolas",7), bg=C["bg_deep"],
+                 fg=C["text_lo"]).pack(pady=(2,0))
+
+    def _actualizar_labels(self, d):
+        self.lbl_score.config(text=str(d["rosa"]))
+        txt, color = nivel_accion(d["rosa"])
+        self.lbl_nivel.config(text=txt, fg=color)
+        self.lbl_score.config(fg=color)
+        def u(attr, val):
+            lbl = getattr(self, attr, None)
+            if lbl: lbl.config(text=str(val))
+        u("lbl_A1", d["A1"]); u("lbl_A2", d["A2"])
+        u("lbl_A3", d["A3"]); u("lbl_A4", d["A4"])
+        u("lbl_tA", d["tabla_A"])
+        u("lbl_ft", f"{d['factor_tiempo']:+d}")
+        u("lbl_tsilla", d["total_silla"])
+        u("lbl_B1", d["B1"]); u("lbl_B2", d["B2"])
+        u("lbl_tB", d["tabla_B"])
+        u("lbl_C1", d["C1"]); u("lbl_C2", d["C2"])
+        u("lbl_tC", d["tabla_C"]); u("lbl_tD", d["tabla_D"])
+        u("lbl_at", f"{d['ang_tronco']:+.1f}")
+        u("lbl_ar", f"{d['ang_rodilla']:.1f}")
+        u("lbl_ac", f"{d['ang_codo']:.1f}")
+        u("lbl_dc", f"{d['desv_cuello']:+.1f}")
+        u("lbl_am", f"{d['ang_muneca']:+.1f}")
+
+    def _update_loop(self):
+        try:
+            frame_rgb = self.cola_frames.get_nowait()
+            img = Image.fromarray(frame_rgb).resize((640,480))
+            imgtk = ImageTk.PhotoImage(image=img)
+            self.canvas.itemconfig(self.img_id, image=imgtk)
+            self.canvas._imgtk = imgtk
+            self.lbl_fps.config(text="Camara activa OK")
+        except queue.Empty:
+            pass
+
+        # ── Ángulos en tiempo real (cada frame) ──
+        try:
+            ang = self.cola_angulos.get_nowait()
+            def u(attr, val):
+                lbl = getattr(self, attr, None)
+                if lbl: lbl.config(text=str(val))
+            u("lbl_at", f"{ang['at']:+.1f}")
+            u("lbl_ar", f"{ang['ar']:.1f}")
+            u("lbl_ac", f"{ang['ac']:.1f}")
+            u("lbl_dc", f"{ang['dc']:+.1f}")
+            u("lbl_am", f"{ang['am']:+.1f}")
+
+            # Colorear según si está en rango óptimo
+            def set_color(attr, val, ok_min, ok_max):
+                lbl = getattr(self, attr, None)
+                if lbl:
+                    color = C["ok"] if ok_min <= abs(val) <= ok_max else C["danger"]
+                    lbl.config(fg=color)
+            set_color("lbl_at", ang["at"],  0,  15)
+            set_color("lbl_ar", ang["ar"], 85, 100)
+            set_color("lbl_ac", ang["ac"], 80, 110)
+            set_color("lbl_dc", ang["dc"],  0,  10)
+            set_color("lbl_am", ang["am"],  0,  15)
+        except queue.Empty:
+            pass
+
+        # ── Dato de evaluación ROSA completo (cada 10s) ──
+        try:
+            dato = self.cola_datos.get_nowait()
+            if "error" in dato:
+                messagebox.showerror("Error", dato["error"])
+                self.destroy()
+                return
+            self.registros.append(dato)
+            self.num_registro += 1
+            self._actualizar_labels(dato)
+            if dato["rosa"] >= NIVEL_ACCION:
+                self._alertar()
+        except queue.Empty:
+            pass
+
+        if (self.registros and
+                time.time() - self._ultimo_guardado >= GUARDADO_SEG):
+            self._guardar_nuevo_registro()
+
+        self.after(30, self._update_loop)
+
+    def _guardar_nuevo_registro(self):
+        if not self.registros: return
+        try:
+            agregar_registro_excel(self.ruta_xlsx,
+                                   self.registros[-1], self.num_registro)
+            self._ultimo_guardado = time.time()
+            self.lbl_xlsx_status.config(
+                text=f"Guardado {time.strftime('%H:%M:%S')}", fg=C["ok"])
+        except Exception as e:
+            self.lbl_xlsx_status.config(
+                text=f"Error guardado: {e}", fg=C["danger"])
+
+    def _guardar_xlsx_manual(self):
+        ruta = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel","*.xlsx")],
+            title="Guardar evaluación ROSA",
+            initialfile=f"ROSA_{time.strftime('%Y%m%d_%H%M%S')}.xlsx")
+        if not ruta: return
+        try:
+            crear_excel_nuevo(ruta)
+            for i, r in enumerate(self.registros, 1):
+                agregar_registro_excel(ruta, r, i)
+            messagebox.showinfo("Guardado", f"Excel guardado en:\n{ruta}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _alertar(self):
+        if WINSOUND_OK:
+            threading.Thread(target=lambda: winsound.Beep(1000,500),
+                             daemon=True).start()
+
+    def on_close(self):
+        self.hilo.activo = False
         self.destroy()
 
 # ─────────────────────────────────────────────────────────────
-# PANEL PRINCIPAL
+# DIÁLOGO DE INICIO
 # ─────────────────────────────────────────────────────────────
-class PanelROSA(tk.Tk):
-    CAM_W, CAM_H = 660, 495
-    PANEL_W      = 400
+def detectar_camaras():
+    camaras = []
+    for i in range(MAX_CAMARAS_SCAN):
+        c = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+        if c.isOpened():
+            camaras.append((i, f"Camara {i}"))
+            c.release()
+    return camaras if camaras else [(0,"Default")]
 
-    def __init__(self, nombre, id_t, uso_horas, cam_idx):
+
+class DialogoInicio(tk.Tk):
+    def __init__(self):
         super().__init__()
-        self.nombre      = nombre; self.id_t        = id_t
-        self.uso_horas   = uso_horas; self.cam_idx  = cam_idx
-        self.factor_t    = factor_tiempo_F(uso_horas)
-        self.inicio_sesion = time.strftime("%Y%m%d_%H%M%S")
-        self.registros   = []; self._reg_guardados  = 0
-        self.toaster     = ToastNotifier() if TOAST_OK else None
-        self._ventana_alerta   = None
-        self._ultimo_resultado = None
-        self.cola_datos  = queue.Queue(maxsize=5)
-        self.cola_frames = queue.Queue(maxsize=2)
+        self.title("ROSA NTP 1173 — Configuracion")
+        self.geometry("420x420")
+        self.configure(bg=C["bg_deep"])
+        self.resizable(False, False)
+        self.resultado = None
         self._build()
-        self._iniciar_camara()
-        self._tick_cd()
-        self._guardado_periodico()
-        self._poll()
 
     def _build(self):
-        self.title(f"ROSA NTP 1173  ·  {self.nombre}  ·  {self.id_t}")
-        self.configure(bg=C["bg_deep"])
-        W = self.CAM_W + self.PANEL_W + 28
-        H = self.CAM_H + 78
-        self.geometry(f"{W}x{H}")
-        self.resizable(False, False)
+        tk.Label(self, text="EVALUADOR ROSA",
+                 font=("Consolas",18,"bold"),
+                 bg=C["bg_deep"], fg=C["accent"]).pack(pady=(24,2))
+        tk.Label(self, text="NTP 1173 · INSST 2022 · MediaPipe 0.10",
+                 font=("Consolas",9),
+                 bg=C["bg_deep"], fg=C["text_lo"]).pack(pady=(0,4))
 
-        sty = ttk.Style(); sty.theme_use("clam")
-        sty.configure("Treeview",
-            background=C["bg_card"], fieldbackground=C["bg_card"],
-            foreground=C["text_mid"], rowheight=20, font=("Courier New",9))
-        sty.configure("Treeview.Heading",
-            background=C["bg_panel"], foreground=C["accent"],
-            font=("Courier New",9,"bold"), relief="flat")
-        sty.map("Treeview",
-            background=[("selected",C["bg_border"])],
-            foreground=[("selected",C["text_hi"])])
-        sty.configure("Bar.Horizontal.TProgressbar",
-            troughcolor=C["bg_panel"], background=C["ok"],
-            thickness=6, bordercolor=C["bg_panel"])
+        # Estado descarga modelo
+        self.lbl_modelo = tk.Label(self,
+                 text="Verificando modelo...",
+                 font=("Consolas",8), bg=C["bg_deep"], fg=C["warn"])
+        self.lbl_modelo.pack(pady=(0,12))
 
-        self.columnconfigure(0, minsize=self.CAM_W+12)
-        self.columnconfigure(1, minsize=self.PANEL_W)
-        self.rowconfigure(0, weight=1)
+        frame = tk.Frame(self, bg=C["bg_card"], padx=20, pady=16)
+        frame.pack(fill="x", padx=30)
 
-        self._build_camara()
-        self._build_panel()
-        self._build_status()
-        self.protocol("WM_DELETE_WINDOW", self._detener)
+        def row(lbl_txt, widget_fn):
+            tk.Label(frame, text=lbl_txt, font=("Consolas",9),
+                     bg=C["bg_card"], fg=C["text_mid"],
+                     anchor="w").pack(fill="x", pady=(4,0))
+            w = widget_fn(frame)
+            w.pack(fill="x", pady=(2,0))
+            return w
 
-    def _build_camara(self):
-        frm = tk.Frame(self, bg=C["bg_panel"],
-                       width=self.CAM_W+12, height=self.CAM_H+52)
-        frm.grid(row=0, column=0, sticky="nsew", padx=(8,4), pady=(8,0))
-        frm.pack_propagate(False); frm.grid_propagate(False)
+        self.ent_nombre = row("Nombre del trabajador:", lambda p: tk.Entry(
+            p, font=("Consolas",10), bg=C["bg_border"],
+            fg=C["text_hi"], insertbackground="white", relief="flat"))
+        self.ent_nombre.insert(0, "Trabajador 01")
 
-        hdr = tk.Frame(frm, bg=C["bg_panel"], height=28)
-        hdr.pack(fill="x"); hdr.pack_propagate(False)
-        tk.Label(hdr, text="  FEED DE CAMARA",
-                 bg=C["bg_panel"], fg=C["accent"],
-                 font=("Courier New",9,"bold")).pack(side="left", pady=5)
-        self.lbl_cam_estado = tk.Label(hdr, text="INICIANDO",
-                 bg=C["bg_panel"], fg=C["text_lo"], font=("Courier New",8))
-        self.lbl_cam_estado.pack(side="right", padx=10)
+        self.spin_horas = row("Horas diarias frente al equipo:",
+                               lambda p: ttk.Spinbox(p, from_=0.5, to=12,
+                               increment=0.5, width=8, font=("Consolas",10)))
+        self.spin_horas.set("6")
 
-        tk.Frame(frm, bg=C["bg_border"], height=1).pack(fill="x")
+        camaras = detectar_camaras()
+        self.combo_cam = row("Camara:", lambda p: ttk.Combobox(
+            p, values=[f"{i}: {n}" for i,n in camaras],
+            state="readonly", font=("Consolas",10)))
+        self.combo_cam.current(0)
+        self._camaras = camaras
 
-        self.cam_canvas = tk.Canvas(frm, width=self.CAM_W, height=self.CAM_H,
-                                    bg="#000", highlightthickness=0)
-        self.cam_canvas.pack(padx=6, pady=6)
-        self._img_id = self.cam_canvas.create_image(0, 0, anchor="nw")
+        tk.Label(self, text="", bg=C["bg_deep"]).pack()
 
-        cd_row = tk.Frame(frm, bg=C["bg_panel"])
-        cd_row.pack(fill="x", padx=6, pady=(0,6))
-        tk.Label(cd_row, text="PROX EVAL",
-                 bg=C["bg_panel"], fg=C["text_lo"],
-                 font=("Courier New",7)).pack(side="left", padx=(4,6))
-        self.barra_cd = ttk.Progressbar(cd_row, style="Bar.Horizontal.TProgressbar",
-                                         maximum=INTERVALO_SEG, length=self.CAM_W-110)
-        self.barra_cd.pack(side="left")
-        self.lbl_cd = tk.Label(cd_row, text=f"{INTERVALO_SEG}s",
-                               bg=C["bg_panel"], fg=C["accent"],
-                               font=("Courier New",9,"bold"), width=5)
-        self.lbl_cd.pack(side="left", padx=6)
+        self.btn_iniciar = tk.Button(self, text="▶  INICIAR EVALUACION",
+                  font=("Consolas",11,"bold"),
+                  bg=C["accent"], fg="white", relief="flat",
+                  cursor="hand2", command=self._ok, state="disabled")
+        self.btn_iniciar.pack(fill="x", padx=30, ipady=8)
 
-    def _build_panel(self):
-        frm = tk.Frame(self, bg=C["bg_deep"],
-                       width=self.PANEL_W, height=self.CAM_H+52)
-        frm.grid(row=0, column=1, sticky="nsew", padx=(4,8), pady=(8,0))
-        frm.pack_propagate(False); frm.grid_propagate(False)
+        # Descargar modelo en background
+        threading.Thread(target=self._verificar_modelo, daemon=True).start()
 
-        cs = tk.Frame(frm, bg=C["bg_card"],
-                      highlightthickness=1, highlightbackground=C["bg_border"])
-        cs.pack(fill="x", pady=(0,5))
-
-        row_s = tk.Frame(cs, bg=C["bg_card"])
-        row_s.pack(fill="x", padx=10, pady=(10,2))
-
-        self.lbl_score = tk.Label(row_s, text="—", bg=C["bg_card"], fg=C["accent"],
-                                  font=("Courier New",78,"bold"), width=3, anchor="center")
-        self.lbl_score.pack(side="left")
-
-        meta = tk.Frame(row_s, bg=C["bg_card"])
-        meta.pack(side="left", fill="y", padx=(6,0), pady=4)
-
-        tk.Label(meta, text="PUNTUACION ROSA",
-                 bg=C["bg_card"], fg=C["text_lo"],
-                 font=("Courier New",8,"bold")).pack(anchor="w")
-        self.lbl_nivel = tk.Label(meta, text="Esperando...",
-                                  bg=C["bg_card"], fg=C["text_mid"],
-                                  font=("Courier New",12,"bold"))
-        self.lbl_nivel.pack(anchor="w", pady=(2,8))
-
-        for attr, lbl_txt in [("lbl_silla", "SILLA  (A + F)"),
-                               ("lbl_perif", "PERIFERICOS  (D)")]:
-            tk.Label(meta, text=lbl_txt, bg=C["bg_card"], fg=C["text_lo"],
-                     font=("Courier New",8)).pack(anchor="w")
-            lbl = tk.Label(meta, text="—", bg=C["bg_card"], fg=C["text_hi"],
-                           font=("Courier New",11,"bold"))
-            lbl.pack(anchor="w")
-            setattr(self, attr, lbl)
-
-        marks = tk.Frame(cs, bg=C["bg_card"])
-        marks.pack(fill="x", padx=10, pady=(6,2))
-        for i in range(1, 11):
-            mc = C["danger"] if i >= 5 else (C["warn"] if i >= 3 else C["ok"])
-            tk.Label(marks, text=str(i), bg=C["bg_card"], fg=mc,
-                     font=("Courier New",7), width=3).pack(side="left", expand=True)
-
-        self.barra_rosa = ttk.Progressbar(cs, style="Bar.Horizontal.TProgressbar",
-                                           maximum=10, length=self.PANEL_W-20)
-        self.barra_rosa.pack(fill="x", padx=10, pady=(0,4))
-
-        tk.Label(cs, text="NTP 1173  ·  Escala 1-10  ·  Nivel de accion >= 5",
-                 bg=C["bg_card"], fg=C["text_lo"],
-                 font=("Courier New",7)).pack(anchor="w", padx=10, pady=(0,8))
-
-        cd2 = tk.Frame(frm, bg=C["bg_card"],
-                       highlightthickness=1, highlightbackground=C["bg_border"])
-        cd2.pack(fill="both", expand=True)
-
-        tk.Label(cd2, text="  DESGLOSE  TABLAS NTP 1173",
-                 bg=C["bg_card"], fg=C["accent"],
-                 font=("Courier New",8,"bold")).pack(anchor="w", pady=(8,4))
-        tk.Frame(cd2, bg=C["bg_border"], height=1).pack(fill="x")
-
-        tree_frm = tk.Frame(cd2, bg=C["bg_card"])
-        tree_frm.pack(fill="both", expand=True, padx=0)
-
-        self.tree = ttk.Treeview(tree_frm, columns=("F","V"),
-                                  show="headings", selectmode="none")
-        self.tree.heading("F", text="Factor NTP 1173")
-        self.tree.heading("V", text="Punt.")
-        self.tree.column("F", width=272, anchor="w")
-        self.tree.column("V", width=50,  anchor="center")
-        sb = ttk.Scrollbar(tree_frm, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True, padx=(4,0))
-        sb.pack(side="right", fill="y", pady=2)
-        self.tree.tag_configure("critico", foreground=C["danger"])
-        self.tree.tag_configure("alto",    foreground=C["warn"])
-        self.tree.tag_configure("ok",      foreground=C["ok"])
-        self.tree.tag_configure("neutro",  foreground=C["text_mid"])
-        self.tree.tag_configure("final",   foreground=C["accent"],
-                                            font=("Courier New",9,"bold"))
-
-    def _build_status(self):
-        bar = tk.Frame(self, bg=C["bg_panel"], height=28)
-        bar.grid(row=1, column=0, columnspan=2, sticky="ew")
-        bar.pack_propagate(False); bar.grid_propagate(False)
-        tk.Frame(bar, bg=C["bg_border"], height=1).pack(fill="x", side="top")
-        tk.Label(bar,
-                 text=f"  {self.nombre.upper()}   |   {self.id_t}   |   {self.uso_horas}h/dia   |   factor F = {self.factor_t:+d}",
-                 bg=C["bg_panel"], fg=C["text_lo"],
-                 font=("Courier New",8)).pack(side="left", pady=5)
-        self.lbl_guardado = tk.Label(bar, text="AUTO-SAVE: —",
-                 bg=C["bg_panel"], fg=C["text_lo"], font=("Courier New",8))
-        self.lbl_guardado.pack(side="right", padx=14)
-
-    def _tick_cd(self):
-        if not hasattr(self, "_cd_val"): self._cd_val = INTERVALO_SEG
-        self._cd_val = max(0, self._cd_val - 1)
-        try:
-            self.lbl_cd.configure(text=f"{self._cd_val}s")
-            self.barra_cd["value"] = INTERVALO_SEG - self._cd_val
-        except: pass
-        self.after(1000, self._tick_cd)
-
-    def _guardado_periodico(self):
-        try:
-            if self._ultimo_resultado is not None:
-                r  = self._ultimo_resultado
-                ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                nivel_txt, _ = nivel_accion(r["rosa"])
-                self.registros.append({
-                    "id_evaluado":         self.id_t,
-                    "nombre_evaluado":     self.nombre,
-                    "horas_uso_diario":    self.uso_horas,
-                    "timestamp":           ts,
-                    "fecha":               ts[:10],
-                    "hora":                ts[11:],
-                    "rosa_final":          r["rosa"],
-                    "nivel_riesgo":        nivel_txt,
-                    "alerta_disparada":    "SI" if r["rosa"] >= NIVEL_ACCION else "NO",
-                    "score_silla":         r["ss"],
-                    "score_perifericos_D": r["sd"],
-                    "p_A1_altura":         r["detalle"].get("p_A1_altura",    ""),
-                    "p_A2_profundidad":    r["detalle"].get("p_A2_profundidad",""),
-                    "p_A3_reposabrazos":   r["detalle"].get("p_A3_reposabrazos",""),
-                    "p_A4_respaldo":       r["detalle"].get("p_A4_respaldo",   ""),
-                    "tabla_A":             r["detalle"].get("tabla_A",         ""),
-                    "factor_F":            r["detalle"].get("factor_F",        ""),
-                    "p_B1_telefono":       r["detalle"].get("p_B1_telefono",   ""),
-                    "p_B2_pantalla":       r["detalle"].get("p_B2_pantalla",   ""),
-                    "tabla_B":             r["detalle"].get("tabla_B",         ""),
-                    "p_C1_raton":          r["detalle"].get("p_C1_raton",      ""),
-                    "p_C2_teclado":        r["detalle"].get("p_C2_teclado",    ""),
-                    "tabla_C":             r["detalle"].get("tabla_C",         ""),
-                    "tabla_D":             r["detalle"].get("tabla_D",         ""),
-                    "ang_tronco_deg":      r["angulos"].get("ang_tronco_deg",      ""),
-                    "ang_cuello_desv_deg": r["angulos"].get("ang_cuello_desv_deg", ""),
-                    "ang_rodilla_deg":     r["angulos"].get("ang_rodilla_deg",     ""),
-                    "ang_codo_deg":        r["angulos"].get("ang_codo_deg",        ""),
-                })
-                exportar_xlsx(self._ruta_xlsx(), self.registros)
-                self._reg_guardados = len(self.registros)
-                try:
-                    self.lbl_guardado.configure(
-                        text=f"AUTO-SAVE: {ts[11:]}  ({len(self.registros)} reg.)",
-                        fg=C["ok"])
-                except: pass
-        except Exception as e:
-            print(f"[ROSA] Guardado auto: {e}")
-        self.after(GUARDADO_SEG * 1000, self._guardado_periodico)
-
-    def _iniciar_camara(self):
-        self.hilo = HiloCamara(self.cola_datos, self.cola_frames,
-                               self.factor_t, self.cam_idx)
-        self.hilo.start()
-
-    def _poll(self):
-        try:
-            rgb = self.cola_frames.get_nowait()
-            img = Image.fromarray(rgb).resize((self.CAM_W, self.CAM_H), Image.LANCZOS)
-            imgtk = ImageTk.PhotoImage(image=img)
-            self.cam_canvas.itemconfig(self._img_id, image=imgtk)
-            self.cam_canvas._imgtk = imgtk
-        except queue.Empty: pass
-
-        try:
-            datos = self.cola_datos.get_nowait()
-            if "error" in datos:
-                messagebox.showerror("Error de camara", datos["error"])
-                self._detener(); return
-            if "fin" in datos:
-                self._detener(); return
-
-            rosa    = datos["rosa"]; ss     = datos["score_silla"]
-            sd      = datos["score_D"]; detalle = datos["detalle"]
-            angulos = datos.get("angulos", {})
-            nivel_txt, col = nivel_accion(rosa)
-            self._cd_val = INTERVALO_SEG
-
-            self.lbl_score.configure(text=str(rosa), fg=col)
-            self.lbl_nivel.configure(text=nivel_txt,  fg=col)
-            self.lbl_silla.configure(text=str(ss))
-            self.lbl_perif.configure(text=str(sd))
-            self.barra_rosa["value"] = rosa
-            ttk.Style().configure("Bar.Horizontal.TProgressbar", background=col)
-            try:
-                self.lbl_cam_estado.configure(
-                    text=f"ROSA={rosa}  S={ss}  D={sd}", fg=col)
-            except: pass
-
-            ETIQ = {
-                "p_A1_altura":       "A-1  Altura asiento",
-                "p_A2_profundidad":  "A-2  Profundidad",
-                "p_A3_reposabrazos": "A-3  Reposabrazos",
-                "p_A4_respaldo":     "A-4  Respaldo",
-                "tabla_A":           "Tabla A  (silla)",
-                "factor_F":          "Tabla F  (tiempo uso)",
-                "score_silla":       "Score Silla  (A + F)",
-                "p_B1_telefono":     "B-1  Telefono",
-                "p_B2_pantalla":     "B-2  Pantalla",
-                "tabla_B":           "Tabla B  (tel + pant)",
-                "p_C1_raton":        "C-1  Raton",
-                "p_C2_teclado":      "C-2  Teclado",
-                "tabla_C":           "Tabla C  (rat + tec)",
-                "tabla_D":           "Tabla D  (perifericos)",
-                "rosa_final":        "> ROSA FINAL",
-            }
-            for item in self.tree.get_children(): self.tree.delete(item)
-            for k, v in detalle.items():
-                if k == "rosa_final":               tag = "final"
-                elif isinstance(v, int) and v >= 5: tag = "critico"
-                elif isinstance(v, int) and v >= 3: tag = "alto"
-                elif isinstance(v, int) and v >= 2: tag = "neutro"
-                else:                               tag = "ok"
-                self.tree.insert("", "end", values=(ETIQ.get(k, k), v), tags=(tag,))
-
-            self._gestionar_alerta(rosa)
-            self._ultimo_resultado = {
-                "rosa": rosa, "ss": ss, "sd": sd,
-                "detalle": detalle, "angulos": angulos,
-            }
-
-        except queue.Empty: pass
-        self.after(40, self._poll)
-
-    def _gestionar_alerta(self, rosa):
-        if rosa >= NIVEL_ACCION:
-            if self._ventana_alerta is None:
-                self._ventana_alerta = VentanaAlerta(
-                    self, rosa, self.nombre,
-                    callback_cerrar=lambda: setattr(self, "_ventana_alerta", None))
-                disparar_toast(self.toaster,
-                               f"ROSA {rosa}/10  -  Nivel de Accion",
-                               f"{self.nombre}\nActuacion inmediata requerida (NTP 1173)")
+    def _verificar_modelo(self):
+        def status(msg):
+            self.lbl_modelo.config(text=msg)
+        ok = descargar_modelo(status)
+        if ok:
+            self.lbl_modelo.config(
+                text="Modelo listo OK", fg=C["ok"])
+            self.btn_iniciar.config(state="normal")
         else:
-            if self._ventana_alerta:
-                try: self._ventana_alerta.cerrar()
-                except: pass
-                self._ventana_alerta = None
+            self.lbl_modelo.config(
+                text="ERROR: no se pudo descargar el modelo", fg=C["danger"])
 
-    def _ruta_xlsx(self):
-        base = os.path.dirname(os.path.abspath(
-            sys.executable if getattr(sys, "frozen", False) else __file__))
-        return os.path.join(base, f"ROSA_{self.id_t}_{self.inicio_sesion}.xlsx")
-
-    def _detener(self):
-        if self._ventana_alerta:
-            try: self._ventana_alerta.cerrar()
-            except: pass
-        if hasattr(self, "hilo"): self.hilo.stop()
-        if self._ultimo_resultado is not None:
-            try:
-                r  = self._ultimo_resultado
-                ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                nivel_txt, _ = nivel_accion(r["rosa"])
-                self.registros.append({
-                    "id_evaluado":       self.id_t,
-                    "nombre_evaluado":   self.nombre,
-                    "horas_uso_diario":  self.uso_horas,
-                    "timestamp": ts, "fecha": ts[:10], "hora": ts[11:],
-                    "rosa_final":        r["rosa"],
-                    "nivel_riesgo":      nivel_txt,
-                    "alerta_disparada":  "SI" if r["rosa"] >= NIVEL_ACCION else "NO",
-                    "score_silla":         r["ss"],
-                    "score_perifericos_D": r["sd"],
-                    "p_A1_altura":         r["detalle"].get("p_A1_altura",    ""),
-                    "p_A2_profundidad":    r["detalle"].get("p_A2_profundidad",""),
-                    "p_A3_reposabrazos":   r["detalle"].get("p_A3_reposabrazos",""),
-                    "p_A4_respaldo":       r["detalle"].get("p_A4_respaldo",   ""),
-                    "tabla_A":             r["detalle"].get("tabla_A",         ""),
-                    "factor_F":            r["detalle"].get("factor_F",        ""),
-                    "p_B1_telefono":       r["detalle"].get("p_B1_telefono",   ""),
-                    "p_B2_pantalla":       r["detalle"].get("p_B2_pantalla",   ""),
-                    "tabla_B":             r["detalle"].get("tabla_B",         ""),
-                    "p_C1_raton":          r["detalle"].get("p_C1_raton",      ""),
-                    "p_C2_teclado":        r["detalle"].get("p_C2_teclado",    ""),
-                    "tabla_C":             r["detalle"].get("tabla_C",         ""),
-                    "tabla_D":             r["detalle"].get("tabla_D",         ""),
-                    "ang_tronco_deg":      r["angulos"].get("ang_tronco_deg",      ""),
-                    "ang_cuello_desv_deg": r["angulos"].get("ang_cuello_desv_deg", ""),
-                    "ang_rodilla_deg":     r["angulos"].get("ang_rodilla_deg",     ""),
-                    "ang_codo_deg":        r["angulos"].get("ang_codo_deg",        ""),
-                })
-            except: pass
-        if self.registros:
-            ruta = self._ruta_xlsx()
-            try:
-                exportar_xlsx(ruta, self.registros)
-                messagebox.showinfo("Sesion guardada",
-                                    f"Informe guardado:\n{ruta}\n{len(self.registros)} registros.",
-                                    parent=self)
-                try: os.startfile(ruta)
-                except: pass
-            except Exception as e:
-                messagebox.showerror("Error al guardar", str(e), parent=self)
-        self.after(300, self.destroy)
+    def _ok(self):
+        nombre  = self.ent_nombre.get().strip() or "Trabajador"
+        horas   = float(self.spin_horas.get())
+        idx_cam = self._camaras[self.combo_cam.current()][0]
+        ruta_xlsx = os.path.join(
+            os.path.expanduser("~"), "Desktop",
+            f"ROSA_{nombre.replace(' ','_')}_{time.strftime('%Y%m%d_%H%M%S')}.xlsx")
+        self.resultado = (nombre, horas, idx_cam, ruta_xlsx)
+        self.destroy()
 
 # ─────────────────────────────────────────────────────────────
-# PUNTO DE ENTRADA
+# MAIN
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    raiz = tk.Tk(); raiz.withdraw()
-    camaras = []
-    def _scan(): camaras.extend(detectar_camaras())
-    t = threading.Thread(target=_scan, daemon=True); t.start(); t.join(timeout=10)
-    if not camaras: camaras = [(0, "Camara 0 (por defecto)")]
-    dialogo = PantallaInicio(raiz, camaras)
-    datos   = dialogo.resultado
-    raiz.destroy()
-    if not datos: sys.exit(0)
-    PanelROSA(
-        nombre    = datos["nombre"],
-        id_t      = datos["id"],
-        uso_horas = datos["horas"],
-        cam_idx   = datos["cam_idx"],
-    ).mainloop()
+    print("[main] Iniciando Evaluador ROSA NTP-1173 v4.1")
+    print(f"[main] Modelo: {MODEL_PATH}")
+
+    dialogo = DialogoInicio()
+    dialogo.mainloop()
+
+    if dialogo.resultado is None:
+        print("[main] Cancelado por el usuario.")
+        sys.exit(0)
+
+    nombre, horas, cam_idx, ruta_xlsx = dialogo.resultado
+    print(f"[main] Trabajador: {nombre} | Horas: {horas} | Cam: {cam_idx}")
+    print(f"[main] Excel: {ruta_xlsx}")
+
+    app = PanelROSA(nombre, horas, cam_idx, ruta_xlsx)
+    app.protocol("WM_DELETE_WINDOW", app.on_close)
+    app.mainloop()
+    print("[main] Aplicación cerrada.")
